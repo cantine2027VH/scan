@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scan Cantine</title>
+<script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<style>
+  body{font-family:sans-serif;margin:0;text-align:center;background:#111;color:#fff}
+  input,button{font-size:20px;padding:12px;margin:6px;border-radius:8px;border:0}
+  #reader{width:100%;max-width:420px;margin:auto}
+  #msg{margin:14px;padding:16px;border-radius:12px;font-size:20px;background:#333}
+  #full{display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:99;align-items:center;justify-content:center;flex-direction:column;font-size:34px;padding:20px;color:#fff;font-weight:bold}
+  #full .big{font-size:120px;line-height:1.1}
+  #full.ok{background:#1b8a3a}#full.dup{background:#d98a00}#full.err{background:#c62828}
+  #startBtn{font-size:26px;padding:18px 28px;background:#1b8a3a;color:#fff}
+</style>
+</head>
+<body>
+<div id="login" style="padding-top:60px">
+  <h2>Code d'accès</h2>
+  <input id="pin" type="password" placeholder="PIN"><br>
+  <button onclick="login()">Entrer</button>
+  <div id="lerr" style="color:#ff8a80"></div>
+</div>
+
+<div id="app" style="display:none">
+  <h2>Scan Cantine</h2>
+  <button id="startBtn" onclick="startScan()">▶ Démarrer le scan</button>
+  <div id="reader"></div>
+  <div id="msg">Appuyez sur Démarrer</div>
+  <input id="manual" placeholder="Code manuel (ex: 6A001)" autocomplete="off">
+  <button onclick="sendManual()">OK</button>
+</div>
+
+<div id="full" onclick="hideFull()"></div>
+
+<script>
+// ⚠️ Mettez ici le lien de VOTRE script (celui qui finit par /exec)
+const API = 'https://script.google.com/macros/s/AKfycbwSzk_a3W4Xmku_B3qosqUxq-BzGXI599Aiq06wHrJZ7b38YrLGG1RZqn7x3MPZ88rH/exec';
+
+let PIN = '';
+try { PIN = localStorage.getItem('pin') || ''; } catch (e) {}
+const queue = [];
+let busy = false, lastCam = '', lastCamT = 0, fullTimer = null, audioCtx = null, scanner = null;
+
+function ctx() {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  } catch (e) {}
+  return audioCtx;
+}
+function beep(freq, dur, when, type) {
+  const c = ctx(); if (!c) return;
+  const o = c.createOscillator(), g = c.createGain();
+  o.type = type || 'sine'; o.frequency.value = freq;
+  const t = c.currentTime + when;
+  g.gain.setValueAtTime(0.3, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g); g.connect(c.destination);
+  o.start(t); o.stop(t + dur + 0.02);
+}
+function soundOk()  { beep(880, 0.12, 0); beep(1320, 0.2, 0.13); }
+function soundDup() { beep(520, 0.15, 0); beep(520, 0.15, 0.22); }
+function soundErr() { beep(200, 0.45, 0, 'sawtooth'); }
+
+function post(body) {
+  return fetch(API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify(body)
+  }).then(r => r.json());
+}
+
+function showMsg(t) { document.getElementById('msg').innerHTML = t; }
+function hideFull() { document.getElementById('full').style.display = 'none'; }
+function showResult(icon, text, c) {
+  showMsg(icon + ' ' + text.replace('<br>', ' - '));
+  const f = document.getElementById('full');
+  f.className = c;
+  f.innerHTML = '<div class="big">' + icon + '</div><div>' + text + '</div>';
+  f.style.display = 'flex';
+  if (c === 'ok') soundOk(); else if (c === 'dup') soundDup(); else soundErr();
+  if (navigator.vibrate) navigator.vibrate(c === 'ok' ? 100 : [100, 60, 100]);
+  clearTimeout(fullTimer);
+  fullTimer = setTimeout(hideFull, 1500);
+}
+
+function send(code) {
+  code = String(code || '').trim();
+  if (code.indexOf('=') > -1) code = code.split('=').pop();
+  if (!code) return;
+  queue.push(code);
+  if (!busy) next();
+}
+function next() {
+  if (!queue.length) { busy = false; return; }
+  busy = true;
+  const code = queue.shift();
+  showMsg('Envoi…');
+  post({ action: 'mark', code: code, pin: PIN }).then(r => {
+    if (r.status === 'ok') showResult('✅', r.name + ' (' + r.cls + ')<br>présent', 'ok');
+    else if (r.status === 'duplicate') showResult('⚠️', r.name + "<br>déjà enregistré aujourd'hui", 'dup');
+    else if (r.status === 'unknown') showResult('❌', 'Code inconnu : ' + r.code, 'err');
+    else if (r.status === 'denied') { try { localStorage.removeItem('pin'); } catch (e) {} location.reload(); return; }
+    else showResult('❌', 'Erreur', 'err');
+    setTimeout(next, 300);
+  }).catch(e => { showResult('❌', 'Réseau : ' + e.message, 'err'); setTimeout(next, 300); });
+}
+function sendManual() {
+  const m = document.getElementById('manual');
+  ctx(); send(m.value); m.value = '';
+}
+function onScan(text) {
+  const now = Date.now();
+  if (text === lastCam && now - lastCamT < 4000) return;
+  lastCam = text; lastCamT = now;
+  send(text);
+}
+
+function login() {
+  PIN = document.getElementById('pin').value.trim();
+  post({ action: 'check', pin: PIN }).then(r => {
+    if (!r.ok) { document.getElementById('lerr').textContent = 'Code incorrect'; return; }
+    try { localStorage.setItem('pin', PIN); } catch (e) {}
+    showApp();
+  }).catch(e => { document.getElementById('lerr').textContent = 'Réseau : ' + e.message; });
+}
+function showApp() {
+  document.getElementById('login').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+}
+
+function startScan() {
+  ctx(); // le clic débloque le son automatique pour toute la session
+  document.getElementById('startBtn').style.display = 'none';
+  scanner = new Html5Qrcode('reader');
+  const cfg = { fps: 10, qrbox: 250 };
+  scanner.start({ facingMode: 'environment' }, cfg, onScan).then(() => showMsg('Prêt à scanner…')).catch(() => {
+    Html5Qrcode.getCameras().then(cams => {
+      if (!cams || !cams.length) throw new Error('aucune caméra');
+      const back = cams.find(c => /back|rear|environment|arrière/i.test(c.label)) || cams[cams.length - 1];
+      return scanner.start(back.id, cfg, onScan);
+    }).then(() => showMsg('Prêt à scanner…'))
+      .catch(err => { showMsg('Caméra non disponible : ' + err); document.getElementById('startBtn').style.display = 'inline-block'; });
+  });
+}
+
+if (PIN) showApp();
+</script>
+</body>
+</html>
